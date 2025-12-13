@@ -364,6 +364,10 @@ void EInkDisplay::swapBuffers() {
 }
 
 void EInkDisplay::grayscaleRevert() {
+  if (!inGrayscaleMode) {
+    return;
+  }
+
   inGrayscaleMode = false;
 
   // Load the revert LUT
