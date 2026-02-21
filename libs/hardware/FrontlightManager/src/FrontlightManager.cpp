@@ -1,189 +1,255 @@
-#include "FrontlightManager.h"
 #include <Arduino.h>
+#include <Logging.h>
+
+#ifdef FRONTLIGHT_PRESENT
+
+#include <driver/gpio.h>
+#include <driver/ledc.h>
+
+#include "FrontlightManager.h"
 
 FrontlightManager::FrontlightManager()
-    : brightness(0), colorTemp(50), isEnabled(false), taskHandle(NULL) {}
+    : brightness(10),
+      colorTemp(50),
+      hardwareFault(false),
+      enabled(false),
+      senseArmed(false),
+      probeTriggered(false),
+      probeTriggeredMs(0) {}
 
 void FrontlightManager::begin() {
-  pinMode(PIN_LED_PWR, OUTPUT);
-  pinMode(PIN_WARM, OUTPUT);
-  pinMode(PIN_COOL, OUTPUT);
-  pinMode(PIN_PWM, OUTPUT); // SHDN
-  pinMode(PIN_SENSE, INPUT_PULLUP);
+  // Install GPIO ISR service required for attachInterruptArg
+  gpio_install_isr_service(0);
+  // ----- LED_PWR rail (IRLML6402 P-FET gate, active LOW) -----
+  // Plain GPIO — PWMing this would destabilise the AP3012 feedback loop.
+  // Brightness is controlled entirely through SHDN (PIN_PWM).
+  gpio_config_t pwr_cfg = {};
+  pwr_cfg.pin_bit_mask = (1ULL << PIN_LED_PWR);
+  pwr_cfg.mode = GPIO_MODE_OUTPUT;
+  gpio_config(&pwr_cfg);
+  gpio_set_level(PIN_LED_PWR, 1);  // Rail off initially
 
-  // Default state: Off
-  digitalWrite(PIN_LED_PWR, HIGH); // OFF (Active Low)
-  digitalWrite(PIN_WARM, LOW);
-  digitalWrite(PIN_COOL, LOW);
-  digitalWrite(PIN_PWM, LOW); // Shutdown
+  // ----- LED_SENSE (active LOW = regulation OK) -----
+  gpio_config_t sense_cfg = {};
+  sense_cfg.pin_bit_mask = (1ULL << PIN_SENSE);
+  sense_cfg.mode = GPIO_MODE_INPUT;
+  sense_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+  gpio_config(&sense_cfg);
+  // In begin(), after sense_cfg setup
+  gpio_set_intr_type((gpio_num_t)PIN_SENSE, GPIO_INTR_POSEDGE);  // RISING = fault
 
-  // Perform self-test on boot? Or user manually calls it?
-  // Let's print a message that we are ready.
-  Serial.println("[Frontlight] Initialized (OFF)");
+  // ----- LEDC Timer 0: RTC8M, 8-bit — SHDN brightness PWM -----
+  ledc_timer_config_t t0 = {.speed_mode = SPEED,
+                            .duty_resolution = PWM_RES,
+                            .timer_num = TIMER0,
+                            .freq_hz = PWM_FREQ,
+                            .clk_cfg = LEDC_USE_RTC8M_CLK};
+  ledc_timer_config(&t0);
 
-  if (testCircuit()) {
-    Serial.println("[Frontlight] Circuit Test PASSED");
-  } else {
-    Serial.println("[Frontlight] Circuit Test FAILED (or no load)");
+  // ----- LEDC Timer 1: RTC8M, 8-bit, 200 Hz — warm/cool blend -----
+  ledc_timer_config_t t1 = {.speed_mode = SPEED,
+                            .duty_resolution = PWM_RES,
+                            .timer_num = TIMER1,
+                            .freq_hz = BLEND_FREQ,
+                            .clk_cfg = LEDC_USE_RTC8M_CLK};
+  ledc_timer_config(&t1);
+
+  ledc_channel_config_t ch_bright = {.gpio_num = PIN_PWM,
+                                     .speed_mode = SPEED,
+                                     .channel = CH_BRIGHT,
+                                     .intr_type = LEDC_INTR_DISABLE,
+                                     .timer_sel = TIMER0,
+                                     .duty = 0,
+                                     .hpoint = 0};
+  ledc_channel_config(&ch_bright);
+
+  ledc_channel_config_t ch_warm = {.gpio_num = PIN_WARM,
+                                   .speed_mode = SPEED,
+                                   .channel = CH_WARM,
+                                   .intr_type = LEDC_INTR_DISABLE,
+                                   .timer_sel = TIMER1,
+                                   .duty = 0,
+                                   .hpoint = 0};
+  ledc_channel_config(&ch_warm);
+
+  ledc_channel_config_t ch_cool = {.gpio_num = PIN_COOL,
+                                   .speed_mode = SPEED,
+                                   .channel = CH_COOL,
+                                   .intr_type = LEDC_INTR_DISABLE,
+                                   .timer_sel = TIMER1,
+                                   .duty = 0,
+                                   .hpoint = 0};
+  ledc_channel_config(&ch_cool);
+}
+
+// --------------------------------------------------------------------------
+
+void FrontlightManager::enableRail(bool on) {
+  gpio_set_level(PIN_LED_PWR, on ? 0 : 1);  // P-FET active LOW
+}
+
+void FrontlightManager::disarmSenseInterrupt() {
+  LOG_DBG("Frontlight", "disarm senseArmed=%d", senseArmed);
+  senseArmed = false;
+  // Unconditional — harmless if not attached, prevents stale interrupts
+  gpio_isr_handler_remove((gpio_num_t)PIN_SENSE);
+}
+
+void FrontlightManager::armSenseInterrupt() {
+  LOG_DBG("Frontlight", "arm senseArmed=%d", senseArmed);
+  if (senseArmed) return;
+  senseArmed = true;
+  gpio_isr_handler_add((gpio_num_t)PIN_SENSE, senseISR, this);
+}
+
+// --------------------------------------------------------------------------
+
+void IRAM_ATTR FrontlightManager::probeISR(void* arg) {
+  FrontlightManager* self = static_cast<FrontlightManager*>(arg);
+  self->probeTriggered = true;
+  self->probeTriggeredMs = millis();
+}
+
+bool FrontlightManager::probeCircuit() {
+  probeTriggered = false;
+  probeTriggeredMs = 0;
+
+  enableRail(true);
+
+  attachInterruptArg(digitalPinToInterrupt(PIN_SENSE), probeISR, this, FALLING);
+
+  ledc_set_duty(SPEED, CH_BRIGHT, MAX_DUTY);
+  ledc_update_duty(SPEED, CH_BRIGHT);
+  ledc_set_duty(SPEED, CH_WARM, MAX_DUTY);
+  ledc_update_duty(SPEED, CH_WARM);
+  ledc_set_duty(SPEED, CH_COOL, MAX_DUTY);
+  ledc_update_duty(SPEED, CH_COOL);
+
+  uint32_t start = millis();
+  while (!probeTriggered && (millis() - start) < PROBE_TIMEOUT_MS) {
+    delay(1);
   }
 
-  // Create the high-priority task for 100Hz Bit-Banging
-  // 100Hz = 10ms period.
-  // We need reasonably good timing, so priority should be high.
-  // Using minimal stack size since logic is simple.
-  xTaskCreatePinnedToCore(FrontlightManager::frontlightTask, "FrontlightTask",
-                          2048, this,
-                          5, // Priority (Higher than Display/Input)
-                          &taskHandle,
-                          1 // Core 1 (App Core)
-  );
+  detachInterrupt(digitalPinToInterrupt(PIN_SENSE));
+
+  if (probeTriggered) {
+    LOG_DBG("Frontlight", "probe regulation acquired in %lums", probeTriggeredMs - start);
+  } else {
+    LOG_DBG("Frontlight", "probe timed out after %lums — no regulation", PROBE_TIMEOUT_MS);
+    // Only zero and kill rail on failure — on success we leave outputs running
+    // so there is no open-circuit gap between probe and updateHardware()
+    ledc_set_duty(SPEED, CH_BRIGHT, 0);
+    ledc_update_duty(SPEED, CH_BRIGHT);
+    ledc_set_duty(SPEED, CH_WARM, 0);
+    ledc_update_duty(SPEED, CH_WARM);
+    ledc_set_duty(SPEED, CH_COOL, 0);
+    ledc_update_duty(SPEED, CH_COOL);
+    enableRail(false);
+  }
+
+  return probeTriggered;
 }
 
-bool FrontlightManager::testCircuit() {
-  Serial.println("[Frontlight] Testing Circuit...");
+// --------------------------------------------------------------------------
 
-  // Sequence:
-  // 1. Enable Main Power
-  digitalWrite(PIN_LED_PWR, LOW); // ON
-  delayMicroseconds(100);
+bool FrontlightManager::enable() {
+  LOG_DBG("Frontlight", "enable called, brightness=%d", brightness);
 
-  // 2. Enable One toggle (Warm)
-  digitalWrite(PIN_WARM, HIGH);
-  digitalWrite(PIN_COOL, LOW);
-  delayMicroseconds(50);
+  disarmSenseInterrupt();
+  hardwareFault = false;
+  enabled = false;
 
-  // 3. Enable Driver
-  digitalWrite(PIN_PWM, HIGH);
-  delayMicroseconds(600); // Wait for current to establish (Diagnostic: ~486us)
+  if (brightness < MIN_BRIGHTNESS) brightness = MIN_BRIGHTNESS;
 
-  // 4. Read Sense
-  bool passed = (digitalRead(PIN_SENSE) == LOW); // LOW means Valid Feedback
+  if (!probeCircuit()) {
+    hardwareFault = true;
+    return false;
+  }
 
-  // 5. Cleanup
-  digitalWrite(PIN_PWM, LOW);
-  digitalWrite(PIN_WARM, LOW);
-  digitalWrite(PIN_COOL, LOW);
-  digitalWrite(PIN_LED_PWR, HIGH); // OFF
+  enabled = true;
+  updateHardware();
 
-  return passed;
+  delay(50);  // Allow SENSE to settle before arming fault ISR —
+              // probe leaves the line in a transitional state and
+              // nobody is hot-swapping strips in under 50ms
+
+  armSenseInterrupt();
+  return true;
 }
+
+void FrontlightManager::disable() {
+  LOG_DBG("Frontlight", "disable called");
+  disarmSenseInterrupt();
+  enabled = false;
+  enableRail(false);
+  updateHardware();
+}
+
+bool FrontlightManager::clearFault() { return enable(); }
+
+// --------------------------------------------------------------------------
 
 void FrontlightManager::setBrightness(uint8_t p) {
-  if (p > 100)
-    p = 100;
+  if (p < MIN_BRIGHTNESS) p = MIN_BRIGHTNESS;
+  if (p > 100) p = 100;
   brightness = p;
+  if (enabled) updateHardware();
 }
 
 void FrontlightManager::setColorTemperature(uint8_t p) {
-  if (p > 100)
-    p = 100;
+  if (p > 100) p = 100;
   colorTemp = p;
+  if (enabled) updateHardware();
 }
 
-void FrontlightManager::frontlightTask(void *param) {
-  FrontlightManager *self = (FrontlightManager *)param;
+// --------------------------------------------------------------------------
 
-  const unsigned long periodMicros = 10000; // 100Hz = 10ms = 10,000us
-
-  for (;;) {
-    unsigned long startFrame = micros();
-
-    // Capture state atomically-ish
-    int b = self->brightness;
-    int t = self->colorTemp;
-
-    if (b == 0) {
-      // OFF State
-      digitalWrite(PIN_LED_PWR, HIGH); // Disable Power
-      digitalWrite(PIN_PWM, LOW);
-      digitalWrite(PIN_WARM, LOW);
-      digitalWrite(PIN_COOL, LOW);
-
-      // Sleep until next frame
-      unsigned long now = micros();
-      long delayUs = periodMicros - (now - startFrame);
-      if (delayUs > 0) {
-        vTaskDelay(pdMS_TO_TICKS(delayUs / 1000));
-        // Better to just wait for next tick if off
-      } else {
-        vTaskDelay(1);
-      }
-      continue;
-    }
-
-    // ON State
-    digitalWrite(PIN_LED_PWR, LOW); // Enable Power
-    // Note: WarmUp required? AP3012 is fast.
-
-    // Calculate Timings
-    // Total ON time = (brightness / 100.0) * periodMicros
-    // Warm Portion = (t / 100.0) * Total ON time
-    // Cool Portion = Total ON time - Warm Portion
-
-    unsigned long totalOnTime = (b * periodMicros) / 100;
-    unsigned long warmTime = (t * totalOnTime) / 100;
-    unsigned long coolTime = totalOnTime - warmTime;
-    unsigned long offTime = periodMicros - totalOnTime;
-
-    // Safety: Make-Before-Break logic
-    // We want to ensure at least one toggle is valid if PWM is ON.
-
-    // Sequence Execution
-
-    // PHASE 1: WARM
-    if (warmTime > 0) {
-      // Ensure Warm is ON, Cool is OFF
-      digitalWrite(PIN_WARM, HIGH);
-      digitalWrite(PIN_COOL,
-                   LOW); // Break Cool? Or maybe keep it? Cleanest is separate.
-      // Actually, if we want to avoid "both off", we set new first then clear
-      // old. But here we are starting fresh frame (usually from Off).
-
-      digitalWrite(PIN_PWM, HIGH); // Driver ON
-
-      // Busy wait for precision
-      unsigned long s = micros();
-      while (micros() - s < warmTime)
-        ;
-    }
-
-    // PHASE 2: COOL
-    // If we transition from Warm to Cool, we must handle the transition
-    // carefully.
-    if (coolTime > 0) {
-      // Turn Cool ON FIRST
-      digitalWrite(PIN_COOL, HIGH);
-      // Then Turn Warm OFF (if it was on)
-      if (warmTime > 0) {
-        digitalWrite(PIN_WARM, LOW);
-      }
-
-      // Ensure Driver is ON (if we skipped warm phase)
-      digitalWrite(PIN_PWM, HIGH);
-
-      unsigned long s = micros();
-      while (micros() - s < coolTime)
-        ;
-    }
-
-    // PHASE 3: OFF
-    digitalWrite(PIN_PWM, LOW); // Driver OFF
-    // Toggles can be anything, but safe to clear
-    digitalWrite(PIN_WARM, LOW);
-    digitalWrite(PIN_COOL, LOW);
-
-    unsigned long now = micros();
-    unsigned long elapsed = now - startFrame;
-    if (elapsed < periodMicros) {
-      unsigned long rem = periodMicros - elapsed;
-      // If remaining time is large (>2ms), yield to RTOS
-      if (rem > 2000) {
-        vTaskDelay(pdMS_TO_TICKS(rem / 1000));
-      } else {
-        // Busy wait the rest to maintain 100Hz stability
-        while ((micros() - startFrame) < periodMicros)
-          ;
-      }
-    }
+void FrontlightManager::updateHardware() {
+  if (!enabled || hardwareFault) {
+    LOG_DBG("Frontlight", "updateHardware zeroing — enabled=%d fault=%d", enabled, hardwareFault);
+    ledc_set_duty(SPEED, CH_BRIGHT, 0);
+    ledc_update_duty(SPEED, CH_BRIGHT);
+    ledc_set_duty(SPEED, CH_WARM, 0);
+    ledc_update_duty(SPEED, CH_WARM);
+    ledc_set_duty(SPEED, CH_COOL, 0);
+    ledc_update_duty(SPEED, CH_COOL);
+    return;
   }
+
+  uint32_t brightDuty = (brightness * MAX_DUTY) / 100;
+  ledc_set_duty(SPEED, CH_BRIGHT, brightDuty);
+  ledc_update_duty(SPEED, CH_BRIGHT);
+
+  // Make-before-break: cool first then warm — boost output never open
+  uint32_t warmDuty = (colorTemp * MAX_DUTY) / 100;
+  uint32_t coolDuty = ((100 - colorTemp) * MAX_DUTY) / 100;
+  ledc_set_duty(SPEED, CH_COOL, coolDuty);
+  ledc_update_duty(SPEED, CH_COOL);
+  ledc_set_duty(SPEED, CH_WARM, warmDuty);
+  ledc_update_duty(SPEED, CH_WARM);
 }
+
+// --------------------------------------------------------------------------
+
+void IRAM_ATTR FrontlightManager::senseISR(void* arg) {
+  FrontlightManager* self = static_cast<FrontlightManager*>(arg);
+  // Serial/Logging inside ISR should be avoided; removed
+
+  // Require SENSE to actually be HIGH at ISR time — filters edge glitches
+  if (digitalRead(PIN_SENSE) == LOW) return;
+
+  // Only armed after a successful probe, so any RISING edge is a genuine fault
+  self->hardwareFault = true;
+  self->enabled = false;
+  self->senseArmed = false;
+
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BRIGHT, 0);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_WARM, 0);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_COOL, 0);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BRIGHT);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_WARM);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_COOL);
+  // Rail brought down by main loop via clearFault()
+}
+
+#endif  // FRONTLIGHT_PRESENT

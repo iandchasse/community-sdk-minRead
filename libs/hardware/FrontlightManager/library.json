@@ -1,0 +1,10 @@
+{
+    "name": "FrontlightManager",
+    "version": "1.0.0",
+    "description": "Manager for the E-Reader Frontlight",
+    "build": {
+        "flags": [
+            "-Iinclude"
+        ]
+    }
+}
