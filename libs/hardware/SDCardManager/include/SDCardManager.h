@@ -2,7 +2,7 @@
 #pragma once
 
 #include <Arduino.h>   // Ensure Arduino.h is included for String
-#include <FsCompat.h>  // Brings in FS.h, SD_MMC.h, and defines FsFile
+#include <FsCompat.h>  // Brings in FS.h, SD_MMC.h, and defines EspFsFile
 #include <SD_MMC.h>
 
 #include <string>
@@ -31,20 +31,20 @@ class SDCardManager {
   // success.
   bool ensureDirectoryExists(const char* path);
 
-  // Wrapper/Helpers that map to SD_MMC. Returns FsFile (wrapper around fs::File).
-  FsFile open(const char* path, const char* mode = FILE_READ) { return FsFile(SD_MMC.open(path, mode)); }
+  // Wrapper/Helpers that map to SD_MMC. Returns EspFsFile (wrapper around fs::File).
+  EspFsFile open(const char* path, const char* mode = FILE_READ) { return EspFsFile(SD_MMC.open(path, mode)); }
   bool mkdir(const char* path) { return SD_MMC.mkdir(path); }
   bool exists(const char* path) { return SD_MMC.exists(path); }
   bool remove(const char* path) { return SD_MMC.remove(path); }
   bool rmdir(const char* path) { return SD_MMC.rmdir(path); }
   bool rename(const char* path, const char* newPath) { return SD_MMC.rename(path, newPath); }
 
-  bool openFileForRead(const char* moduleName, const char* path, FsFile& file);
-  bool openFileForRead(const char* moduleName, const std::string& path, FsFile& file);
-  bool openFileForRead(const char* moduleName, const String& path, FsFile& file);
-  bool openFileForWrite(const char* moduleName, const char* path, FsFile& file);
-  bool openFileForWrite(const char* moduleName, const std::string& path, FsFile& file);
-  bool openFileForWrite(const char* moduleName, const String& path, FsFile& file);
+  bool openFileForRead(const char* moduleName, const char* path, EspFsFile& file);
+  bool openFileForRead(const char* moduleName, const std::string& path, EspFsFile& file);
+  bool openFileForRead(const char* moduleName, const String& path, EspFsFile& file);
+  bool openFileForWrite(const char* moduleName, const char* path, EspFsFile& file);
+  bool openFileForWrite(const char* moduleName, const std::string& path, EspFsFile& file);
+  bool openFileForWrite(const char* moduleName, const String& path, EspFsFile& file);
   bool removeDir(const char* path);
 
   static SDCardManager& getInstance() { return instance; }

@@ -72,7 +72,7 @@ String SDCardManager::readFile(const char* path) {
     return {""};
   }
 
-  FsFile f;
+  EspFsFile f;
   if (!openFileForRead("SD", path, f)) {
     return {""};
   }
@@ -96,7 +96,7 @@ bool SDCardManager::readFileToStream(const char* path, Print& out, const size_t 
     return false;
   }
 
-  FsFile f;
+  EspFsFile f;
   if (!openFileForRead("SD", path, f)) {
     return false;
   }
@@ -127,7 +127,7 @@ size_t SDCardManager::readFileToBuffer(const char* path, char* buffer, const siz
     return 0;
   }
 
-  FsFile f;
+  EspFsFile f;
   if (!openFileForRead("SD", path, f)) {
     buffer[0] = '\0';
     return 0;
@@ -166,7 +166,7 @@ bool SDCardManager::writeFile(const char* path, const String& content) {
     SD_MMC.remove(path);
   }
 
-  FsFile f;
+  EspFsFile f;
   if (!openFileForWrite("SD", path, f)) {
     if (Serial) Serial.printf("[%lu] [SD] Path is not a directory\n", millis());
     if (Serial) Serial.printf("Failed to open file for write: %s\n", path);
@@ -209,13 +209,13 @@ bool SDCardManager::ensureDirectoryExists(const char* path) {
   }
 }
 
-bool SDCardManager::openFileForRead(const char* moduleName, const char* path, FsFile& file) {
+bool SDCardManager::openFileForRead(const char* moduleName, const char* path, EspFsFile& file) {
   if (!SD_MMC.exists(path)) {
     if (Serial) Serial.printf("[%lu] [%s] File does not exist: %s\n", millis(), moduleName, path);
     return false;
   }
 
-  file = FsFile(SD_MMC.open(path, FILE_READ));
+  file = EspFsFile(SD_MMC.open(path, FILE_READ));
   if (!file) {
     if (Serial) Serial.printf("[%lu] [%s] Failed to open file for reading: %s\n", millis(), moduleName, path);
     return false;
@@ -223,16 +223,16 @@ bool SDCardManager::openFileForRead(const char* moduleName, const char* path, Fs
   return true;
 }
 
-bool SDCardManager::openFileForRead(const char* moduleName, const std::string& path, FsFile& file) {
+bool SDCardManager::openFileForRead(const char* moduleName, const std::string& path, EspFsFile& file) {
   return openFileForRead(moduleName, path.c_str(), file);
 }
 
-bool SDCardManager::openFileForRead(const char* moduleName, const String& path, FsFile& file) {
+bool SDCardManager::openFileForRead(const char* moduleName, const String& path, EspFsFile& file) {
   return openFileForRead(moduleName, path.c_str(), file);
 }
 
-bool SDCardManager::openFileForWrite(const char* moduleName, const char* path, FsFile& file) {
-  file = FsFile(SD_MMC.open(path, FILE_WRITE));
+bool SDCardManager::openFileForWrite(const char* moduleName, const char* path, EspFsFile& file) {
+  file = EspFsFile(SD_MMC.open(path, FILE_WRITE));
   if (!file) {
     if (Serial) Serial.printf("[%lu] [%s] Failed to open file for writing: %s\n", millis(), moduleName, path);
     return false;
@@ -240,11 +240,11 @@ bool SDCardManager::openFileForWrite(const char* moduleName, const char* path, F
   return true;
 }
 
-bool SDCardManager::openFileForWrite(const char* moduleName, const std::string& path, FsFile& file) {
+bool SDCardManager::openFileForWrite(const char* moduleName, const std::string& path, EspFsFile& file) {
   return openFileForWrite(moduleName, path.c_str(), file);
 }
 
-bool SDCardManager::openFileForWrite(const char* moduleName, const String& path, FsFile& file) {
+bool SDCardManager::openFileForWrite(const char* moduleName, const String& path, EspFsFile& file) {
   return openFileForWrite(moduleName, path.c_str(), file);
 }
 
