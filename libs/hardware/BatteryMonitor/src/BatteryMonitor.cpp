@@ -1,10 +1,11 @@
 #include "BatteryMonitor.h"
 
-#include <esp32-hal-adc.h>
-#include <esp_adc_cal.h>
+#include <Arduino.h>
+#include <esp_idf_version.h>
 
-inline float min(const float a, const float b) { return a < b ? a : b; }
-inline float max(const float a, const float b) { return a > b ? a : b; }
+#if ESP_IDF_VERSION_MAJOR < 5
+#include <esp_adc_cal.h>
+#endif
 
 BatteryMonitor::BatteryMonitor(uint8_t adcPin, float dividerMultiplier, int8_t statusPin)
     : _adcPin(adcPin), _dividerMultiplier(dividerMultiplier), _statusPin(statusPin) {
@@ -17,6 +18,8 @@ BatteryMonitor::BatteryMonitor(uint8_t adcPin, float dividerMultiplier, int8_t s
   }
 }
 
+uint16_t BatteryMonitor::readPercentage() const { return percentageFromMillivolts(readMillivolts()); }
+
 bool BatteryMonitor::isCharging() const {
   if (_statusPin < 0) return false;
   // LOW = Charging or Charge Complete
@@ -24,17 +27,19 @@ bool BatteryMonitor::isCharging() const {
   return digitalRead(_statusPin) == LOW;
 }
 
-uint16_t BatteryMonitor::readPercentage() const { return percentageFromMillivolts(readMillivolts()); }
-
 uint16_t BatteryMonitor::readMillivolts() const {
-  const uint16_t raw = readRawMillivolts();
-  const uint32_t mv = millivoltsFromRawAdc(raw);
-  return static_cast<uint32_t>(mv * _dividerMultiplier);
-}
-
-uint16_t BatteryMonitor::readRawMillivolts() const {
+#if ESP_IDF_VERSION_MAJOR < 5
+  // ESP-IDF 4.x doesn't have analogReadMilliVolts, so we need to do the calibration manually
   const uint16_t raw = analogRead(_adcPin);
-  return raw;
+  esp_adc_cal_characteristics_t adc_chars;
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+  const uint16_t mv = esp_adc_cal_raw_to_voltage(raw, &adc_chars);
+#else
+  // ESP-IDF 5.x has analogReadMilliVolts
+  const uint16_t mv = analogReadMilliVolts(_adcPin);
+#endif
+
+  return static_cast<uint16_t>(mv * _dividerMultiplier);
 }
 
 double BatteryMonitor::readVolts() const { return static_cast<double>(readMillivolts()) / 1000.0; }
@@ -49,10 +54,4 @@ uint16_t BatteryMonitor::percentageFromMillivolts(uint16_t millivolts) {
   y = min(y, 100.0);
   y = round(y);
   return static_cast<int>(y);
-}
-
-uint16_t BatteryMonitor::millivoltsFromRawAdc(uint16_t adc_raw) {
-  esp_adc_cal_characteristics_t adc_chars;
-  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
-  return esp_adc_cal_raw_to_voltage(adc_raw, &adc_chars);
 }

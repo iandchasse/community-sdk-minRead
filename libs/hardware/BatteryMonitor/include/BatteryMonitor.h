@@ -13,9 +13,6 @@ class BatteryMonitor {
   // Read the battery voltage in millivolts (accounts for divider)
   uint16_t readMillivolts() const;
 
-  // Read raw millivolts from ADC (doesn't account for divider)
-  uint16_t readRawMillivolts() const;
-
   // Read the battery voltage in volts (accounts for divider)
   double readVolts() const;
 
