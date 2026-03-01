@@ -243,7 +243,8 @@ void EInkDisplay::initDisplayController() {
   sendData(0xC7);
   sendData(0xC3);
   sendData(0xC0);
-  sendData(0x40);
+  // sendData(0x40); // shorter on-time led to weak refreshes on my hardware...
+  sendData(0x80);  // boost it up, better quality images
 
   // Driver output control: set display height (480) and scan direction
   const uint16_t HEIGHT = 480;
