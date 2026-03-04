@@ -132,7 +132,7 @@ void EInkDisplay::begin() {
   frameBufferActive = frameBuffer1;
 #endif
 
-  // Initialize to white
+  // Initialize framebuffer to white
   memset(frameBuffer0, 0xFF, BUFFER_SIZE);
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   if (Serial) Serial.printf("[%lu]   Static frame buffer (%lu bytes = 48KB)\n", millis(), BUFFER_SIZE);
@@ -143,27 +143,32 @@ void EInkDisplay::begin() {
 
   if (Serial) Serial.printf("[%lu]   Initializing e-ink display driver...\n", millis());
 
-  // Initialize SPI with custom pins
-  SPI.begin(_sclk, -1, _mosi, _cs);
-  spiSettings = SPISettings(40000000, MSBFIRST, SPI_MODE0);  // MODE0 is standard for SSD1677
-  if (Serial) Serial.printf("[%lu]   SPI initialized at 40 MHz, Mode 0\n", millis());
+  // Initialize bb_epaper: configure panel type, then bring up SPI/GPIO and run panel init sequence
+  bbep.setPanelType(EP426_800x480_4GRAY);
+  bbep.initIO(_dc, _rst, _busy, _cs, _mosi, _sclk, 40000000);
+  if (Serial) Serial.printf("[%lu]   bb_epaper initialized at 40 MHz\n", millis());
 
-  // Setup GPIO pins
-  pinMode(_cs, OUTPUT);
-  pinMode(_dc, OUTPUT);
-  pinMode(_rst, OUTPUT);
-  pinMode(_busy, INPUT);
+  // Override border waveform to white (bb_epaper init sets it to black / 0x00)
+  uint8_t borderByte = 0x01;
+  bbep.writeCmd(CMD_BORDER_WAVEFORM);
+  bbep.writeData(&borderByte, 1);
 
-  digitalWrite(_cs, HIGH);
-  digitalWrite(_dc, HIGH);
+  // Clear both RAM planes to white
+  if (Serial) Serial.printf("[%lu]   Clearing RAM buffers...\n", millis());
+  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  uint8_t fillByte = 0xF7;
+  bbep.writeCmd(CMD_AUTO_WRITE_BW_RAM);
+  bbep.writeData(&fillByte, 1);
+  waitWhileBusy(" CMD_AUTO_WRITE_BW_RAM");
 
-  if (Serial) Serial.printf("[%lu]   GPIO pins configured\n", millis());
+  bbep.writeCmd(CMD_AUTO_WRITE_RED_RAM);
+  bbep.writeData(&fillByte, 1);
+  waitWhileBusy(" CMD_AUTO_WRITE_RED_RAM");
 
-  // Reset display
-  resetDisplay();
-
-  // Initialize display controller
-  initDisplayController();
+  isScreenOn = false;
+  customLutActive = false;
+  inGrayscaleMode = false;
+  drawGrayscale = false;
 
   if (Serial) Serial.printf("[%lu]   E-ink display driver initialized\n", millis());
 }
@@ -172,42 +177,16 @@ void EInkDisplay::begin() {
 // Low-level display control methods
 // ============================================================================
 
-void EInkDisplay::resetDisplay() {
-  if (Serial) Serial.printf("[%lu]   Resetting display...\n", millis());
-  digitalWrite(_rst, HIGH);
-  delay(20);
-  digitalWrite(_rst, LOW);
-  delay(2);
-  digitalWrite(_rst, HIGH);
-  delay(20);
-  if (Serial) Serial.printf("[%lu]   Display reset complete\n", millis());
-}
-
 void EInkDisplay::sendCommand(uint8_t command) {
-  SPI.beginTransaction(spiSettings);
-  digitalWrite(_dc, LOW);  // Command mode
-  digitalWrite(_cs, LOW);  // Select chip
-  SPI.transfer(command);
-  digitalWrite(_cs, HIGH);  // Deselect chip
-  SPI.endTransaction();
+  bbep.writeCmd(command);
 }
 
 void EInkDisplay::sendData(uint8_t data) {
-  SPI.beginTransaction(spiSettings);
-  digitalWrite(_dc, HIGH);  // Data mode
-  digitalWrite(_cs, LOW);   // Select chip
-  SPI.transfer(data);
-  digitalWrite(_cs, HIGH);  // Deselect chip
-  SPI.endTransaction();
+  bbep.writeData(&data, 1);
 }
 
 void EInkDisplay::sendData(const uint8_t* data, uint16_t length) {
-  SPI.beginTransaction(spiSettings);
-  digitalWrite(_dc, HIGH);       // Data mode
-  digitalWrite(_cs, LOW);        // Select chip
-  SPI.writeBytes(data, length);  // Transfer all bytes
-  digitalWrite(_cs, HIGH);       // Deselect chip
-  SPI.endTransaction();
+  bbep.writeData(const_cast<uint8_t*>(data), length);
 }
 
 void EInkDisplay::waitWhileBusy(const char* comment) {
@@ -222,57 +201,6 @@ void EInkDisplay::waitWhileBusy(const char* comment) {
   if (comment) {
     if (Serial) Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), comment, millis() - start);
   }
-}
-
-void EInkDisplay::initDisplayController() {
-  if (Serial) Serial.printf("[%lu]   Initializing SSD1677 controller...\n", millis());
-
-  const uint8_t TEMP_SENSOR_INTERNAL = 0x80;
-
-  // Soft reset
-  sendCommand(CMD_SOFT_RESET);
-  waitWhileBusy(" CMD_SOFT_RESET");
-
-  // Temperature sensor control (internal)
-  sendCommand(CMD_TEMP_SENSOR_CONTROL);
-  sendData(TEMP_SENSOR_INTERNAL);
-
-  // Booster soft-start control (GDEQ0426T82 specific values)
-  sendCommand(CMD_BOOSTER_SOFT_START);
-  sendData(0xAE);
-  sendData(0xC7);
-  sendData(0xC3);
-  sendData(0xC0);
-  sendData(0xC0);  // boost it up, better quality images
-
-  // Driver output control: set display height (480) and scan direction
-  const uint16_t HEIGHT = 480;
-  sendCommand(CMD_DRIVER_OUTPUT_CONTROL);
-  sendData((HEIGHT - 1) % 256);  // gates A0..A7 (low byte)
-  sendData((HEIGHT - 1) / 256);  // gates A8..A9 (high byte)
-#ifdef FLIPPED
-  sendData(0x03);  // SM=1 (interlaced), TB=1 (hardware vertical flip)
-#else
-  sendData(0x02);  // SM=1 (interlaced), TB=0
-#endif
-
-  // Border waveform control
-  sendCommand(CMD_BORDER_WAVEFORM);
-  sendData(0x01);
-
-  // Set up full screen RAM area
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-
-  if (Serial) Serial.printf("[%lu]   Clearing RAM buffers...\n", millis());
-  sendCommand(CMD_AUTO_WRITE_BW_RAM);  // Auto write BW RAM
-  sendData(0xF7);
-  waitWhileBusy(" CMD_AUTO_WRITE_BW_RAM");
-
-  sendCommand(CMD_AUTO_WRITE_RED_RAM);  // Auto write RED RAM
-  sendData(0xF7);                       // Fill with white pattern
-  waitWhileBusy(" CMD_AUTO_WRITE_RED_RAM");
-
-  if (Serial) Serial.printf("[%lu]   SSD1677 controller initialized\n", millis());
 }
 
 void EInkDisplay::setRamArea(const uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
@@ -437,39 +365,6 @@ void EInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
 }
 #endif
 
-// Reverse the bits of a byte (MSB<->LSB), used for 180-degree framebuffer flip.
-static uint8_t reverseBits(uint8_t b) {
-  b = ((b & 0xF0) >> 4) | ((b & 0x0F) << 4);
-  b = ((b & 0xCC) >> 2) | ((b & 0x33) << 2);
-  b = ((b & 0xAA) >> 1) | ((b & 0x55) << 1);
-  return b;
-}
-
-// Write the framebuffer to display RAM with X flipped (horizontally mirrored):
-// rows are written top-to-bottom normally, but bytes are right-to-left, bits reversed.
-// Used with hardware TB=1 vertical flip to achieve full 180 orientation.
-void EInkDisplay::writeRamBufferXFlipped(uint8_t ramBuffer, const uint8_t* buffer) {
-  const char* bufferName = (ramBuffer == CMD_WRITE_RAM_BW) ? "BW" : "RED";
-  const unsigned long startTime = millis();
-  if (Serial) Serial.printf("[%lu]   Writing X-FLIPPED frame buffer to %s RAM...\n", startTime, bufferName);
-
-  sendCommand(ramBuffer);
-  SPI.beginTransaction(spiSettings);
-  digitalWrite(_dc, HIGH);
-  digitalWrite(_cs, LOW);
-  for (int row = 0; row < DISPLAY_HEIGHT; row++) {
-    const uint8_t* rowPtr = &buffer[row * DISPLAY_WIDTH_BYTES];
-    for (int col = DISPLAY_WIDTH_BYTES - 1; col >= 0; col--) {
-      SPI.transfer(reverseBits(rowPtr[col]));
-    }
-  }
-  digitalWrite(_cs, HIGH);
-  SPI.endTransaction();
-
-  if (Serial)
-    Serial.printf("[%lu]   X-FLIPPED %s RAM write complete (%lu ms)\n", millis(), bufferName, millis() - startTime);
-}
-
 void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
   if (!isScreenOn && !turnOffScreen) {
     // Force half refresh if screen is off
@@ -487,28 +382,15 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
 
   if (mode != FAST_REFRESH) {
     // For full/half refresh, write to both BW and RED RAM before refresh
-#ifdef FLIPPED
-    writeRamBufferXFlipped(CMD_WRITE_RAM_BW, frameBuffer);
-    writeRamBufferXFlipped(CMD_WRITE_RAM_RED, frameBuffer);
-#else
     writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, BUFFER_SIZE);
     writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, BUFFER_SIZE);
-#endif
   } else {
-    // For fast refresh, write to BW buffer only
-#ifdef FLIPPED
-    writeRamBufferXFlipped(CMD_WRITE_RAM_BW, frameBuffer);
-#else
+    // For fast refresh, write new frame to BW RAM and previous frame to RED RAM
     writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, BUFFER_SIZE);
-#endif
     // In single buffer mode, the RED RAM should already contain the previous frame
     // In dual buffer mode, we write back frameBufferActive which is the last frame
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-#ifdef FLIPPED
-    writeRamBufferXFlipped(CMD_WRITE_RAM_RED, frameBufferActive);
-#else
     writeRamBuffer(CMD_WRITE_RAM_RED, frameBufferActive, BUFFER_SIZE);
-#endif
 #endif
   }
 
@@ -522,11 +404,7 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   // In single buffer mode always sync RED RAM after refresh to prepare for next fast refresh
   setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-#ifdef FLIPPED
-  writeRamBufferXFlipped(CMD_WRITE_RAM_RED, frameBuffer);
-#else
   writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, BUFFER_SIZE);
-#endif
 #endif
 }
 
@@ -652,28 +530,13 @@ void EInkDisplay::refreshDisplay(const RefreshMode mode, const bool turnOffScree
   if (mode == FULL_REFRESH) {
     displayMode |= 0x34;
   } else if (mode == HALF_REFRESH) {
-    // #ifdef FLIPPED
-    // The FL wrapper's OTP waveform doesn't work well with the temp trick.
-    // Use the standard full-refresh waveform (0x34) for half-refresh,
-    // which still skips some initialization if the screen is already on.
     displayMode |= 0x34;
-    // #else
-    //     // Write high temp to the register for a faster refresh
-    //     sendCommand(CMD_WRITE_TEMP);
-    //     sendData(0x5A);
-    //     displayMode |= 0xD4;
-    // #endif
   } else {  // FAST_REFRESH
-            // #ifdef FLIPPED
-    // The default OTP fast refresh waveform on the FL panel is too weak at room temperature,
-    // leaving massive ghosting. Force 0°C to invoke a much stronger/longer partial update waveform.
+    // Force temperature register to ~25°C to invoke a stronger partial update waveform.
+    // The OTP fast-refresh waveform at room temperature produces heavy ghosting on this panel.
     sendCommand(CMD_WRITE_TEMP);
-    // sendData(0x00);
     sendData(0x19);                                // ~25°C
     displayMode |= customLutActive ? 0x2C : 0x3C;  // Adds TEMP_LOAD bit (0x20) to 0x0C/0x1C
-                                                   // #else
-                                                   //     displayMode |= customLutActive ? 0x0C : 0x1C;
-                                                   // #endif
   }
 
   // Power on and refresh display
