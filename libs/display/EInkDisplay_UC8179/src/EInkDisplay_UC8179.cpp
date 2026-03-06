@@ -21,7 +21,6 @@
 
 #include <cstring>
 
-
 #ifndef ARDUINO
 #include <fstream>
 #include <vector>
@@ -182,41 +181,38 @@ static const uint8_t lut_partial_LUTBD[42] PROGMEM = {
 //   Too high -> gray too dark, looks almost BW
 //   Start 15, adjust +-3 until gray levels look right.
 // ============================================================================
-#define TG_MAIN 15
-#define TG_SETTLE 3
+#define TG_MAIN 8    // frames to reach gray — reduce if text thins/disappears
+#define TG_SETTLE 3  // settling at GND after drive
 
-// LUTC: VCOM at GND during gray drive (no VCOM contribution to gray level)
+// LUTC: apply VCOM during gray drive (11=VCOM helps move particles)
 static const uint8_t lut_gray_LUTC[42] PROGMEM = {
-    0x00, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0xC0, TG_MAIN, TG_SETTLE, 0, 0, 1,  // PhA=VCOM(11), PhB=GND(00)
+    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
-// LUTWW: white->white NOP (must have nonzero frame count or controller skips)
+// LUTWW: white->white, same timing as active LUTs so DRF waits correctly
 static const uint8_t lut_gray_LUTWW[42] PROGMEM = {
     0x00, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
-// LUTKW: black->light gray
-//   Drive VDL(10)=white for TG_MAIN frames from fully-black starting state.
-//   Stops partway = light gray.
-//   Encoding: 10_00_00_00 = 0x80
+// LUTKW: black->light gray. VDL(10)=white drive for TG_MAIN frames.
+// 0x80 = 10_00_00_00
 static const uint8_t lut_gray_LUTKW[42] PROGMEM = {
     0x80, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
-// LUTWK: white->dark gray
-//   Drive VDH(01)=black for TG_MAIN frames from fully-white starting state.
-//   Stops partway = dark gray.
-//   Encoding: 01_00_00_00 = 0x40
+// LUTWK: white->dark gray. VDH(01)=black drive for TG_MAIN frames.
+// 0x40 = 01_00_00_00
 static const uint8_t lut_gray_LUTWK[42] PROGMEM = {
     0x40, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
-// LUTKK: black->black NOP (nonzero frame count to match DRF timing)
+// LUTKK: black->black, match timing
 static const uint8_t lut_gray_LUTKK[42] PROGMEM = {
     0x00, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
-// LUTBD: border NOP (match timing)
+// LUTBD: border, match timing
 static const uint8_t lut_gray_LUTBD[42] PROGMEM = {
     0x00, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -232,7 +228,9 @@ EInkDisplay_UC8179::EInkDisplay_UC8179(int8_t sclk, int8_t mosi, int8_t cs, int8
       _dc(dc),
       _rst(rst),
       _busy(busy),
-      frameBuffer(nullptr)
+      frameBuffer(nullptr),
+      bwBase(nullptr),
+      cached_lsb_mask(nullptr)
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
       ,
       frameBufferPrev(nullptr)
@@ -324,6 +322,15 @@ void EInkDisplay_UC8179::drawImageTransparent(const uint8_t* img, uint16_t x, ui
 // ============================================================================
 // Grayscale buffer helpers
 // ============================================================================
+void EInkDisplay_UC8179::storeBwBase(const uint8_t* bwBuffer) {
+  // Called by GfxRenderer::storeBwBuffer() while frameBuffer still holds the
+  // BW page — before clearScreen(0x00) for the gray render passes.
+  if (!bwBase) bwBase = (uint8_t*)malloc(BUFFER_SIZE);
+  if (bwBase)
+    memcpy(bwBase, bwBuffer, BUFFER_SIZE);
+  else if (Serial)
+    Serial.println("storeBwBase: malloc failed");
+}
 void EInkDisplay_UC8179::copyGrayscaleLsbBuffers(const uint8_t* lsb) {
   if (!cached_lsb_mask) {
     cached_lsb_mask = (uint8_t*)malloc(BUFFER_SIZE);
@@ -338,39 +345,46 @@ void EInkDisplay_UC8179::copyGrayscaleLsbBuffers(const uint8_t* lsb) {
 void EInkDisplay_UC8179::copyGrayscaleMsbBuffers(const uint8_t* msb) {
   if (!cached_lsb_mask) return;
 
-#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  uint8_t* base = frameBufferPrev;
-#else
-  uint8_t* base = frameBuffer;
-#endif
+  // bwBase is snapshot of the BW frame taken inside displayBuffer before DRF.
+  // frameBuffer/frameBufferPrev are wrong here: frameBuffer has been clearScreen'd
+  // to 0x00 for the LSB/MSB render passes, and in SINGLE_BUFFER_MODE there is no
+  // separate prev buffer. bwBase is the only reliable reference to the pre-gray
+  // BW page state needed for compositing.
+  uint8_t* base = bwBase;
+  if (!base) {
+    if (Serial) Serial.println("copyGrayscaleMsbBuffers: bwBase not set, gray composite aborted");
+    free(cached_lsb_mask);
+    cached_lsb_mask = nullptr;
+    return;
+  }
 
   uint8_t* target = (uint8_t*)malloc(BUFFER_SIZE);
   if (target) {
-    // UC8179 register LUT routes on (DTM1=old, DTM2=new) pixel pairs:
-    //   (0,0) LUTKK -> black NOP          (1,1) LUTWW -> white NOP
-    //   (0,1) LUTKW -> black->light gray   (1,0) LUTWK -> white->dark gray
+    // Compositing formula — derived from renderer + LUT routing:
     //
-    // Renderer convention: drawPixel(false) SETS the bit to 1 (white direction).
-    // Buffers start as BW copy (black text=0, white bg=1).
-    // Gray pixel bits are set to 1 (carved out of black text):
-    //   MSB buf: bmpVal==1 (dark gray) or bmpVal==2 (light gray) -> bit set to 1
-    //   LSB buf: bmpVal==1 (dark gray) only                       -> bit set to 1
+    // Renderer uses clearScreen(0x00) then sets bits to 1 for gray pixels:
+    //   msb buf: bit=1 for bmpVal==1 (dark gray) OR bmpVal==2 (light gray)
+    //   lsb buf: bit=1 for bmpVal==1 (dark gray) only
     //
-    // Truth table (b=base, m=msb_buf, l=lsb_buf):
-    //   b=0 m=0 l=0 -> pure black  -> DTM1=0, DTM2=0 -> LUTKK NOP
-    //   b=0 m=1 l=0 -> light gray  -> DTM1=0, DTM2=1 -> LUTKW black->light gray
-    //   b=0 m=1 l=1 -> dark gray   -> DTM1=1, DTM2=0 -> LUTWK white->dark gray
-    //   b=1 m=0 l=0 -> white bg    -> DTM1=1, DTM2=1 -> LUTWW NOP
+    // UC8179 LUT routes on (DTM1=old, DTM2=new):
+    //   (0,0) LUTKK  (1,1) LUTWW  (0,1) LUTKW  (1,0) LUTWK
     //
-    // Derived:  DTM1 = base | (msb & lsb)
-    //           DTM2 = base | (msb & ~lsb)
+    // Goal: when msb=1, drive the pixel toward the OPPOSITE of its base state.
+    //   base=0 (black), msb=1 -> LUTKW (black->light gray) -> need DTM1=0, DTM2=1
+    //   base=1 (white), msb=1 -> LUTWK (white->dark gray)  -> need DTM1=1, DTM2=0
+    //   base=0, msb=0 -> LUTKK NOP -> DTM1=0, DTM2=0
+    //   base=1, msb=0 -> LUTWW NOP -> DTM1=1, DTM2=1
+    //
+    // Solution:
+    //   DTM1 = base            (preserves routing direction)
+    //   DTM2 = base ^ msb      (flips only where msb=1)
     for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
-      target[i] = base[i] | (msb[i] & cached_lsb_mask[i]);
+      target[i] = base[i];
     }
     writeDTM1(target, BUFFER_SIZE);
 
     for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
-      target[i] = base[i] | (msb[i] & ~cached_lsb_mask[i]);
+      target[i] = base[i] ^ msb[i];
     }
     writeDTM2(target, BUFFER_SIZE);
 
@@ -381,6 +395,8 @@ void EInkDisplay_UC8179::copyGrayscaleMsbBuffers(const uint8_t* msb) {
 
   free(cached_lsb_mask);
   cached_lsb_mask = nullptr;
+  free(bwBase);
+  bwBase = nullptr;
 }
 
 void EInkDisplay_UC8179::copyGrayscaleBuffers(const uint8_t* lsb, const uint8_t* msb) {

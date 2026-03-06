@@ -59,6 +59,7 @@ class EInkDisplay_UC8179 {
 #endif
 
   // Grayscale buffer helpers
+  void storeBwBase(const uint8_t* bwBuffer);  // call from storeBwBuffer() before clearScreen
   void copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer);
   void copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer);
   void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer);
@@ -103,6 +104,10 @@ class EInkDisplay_UC8179 {
   bool _using_partial_mode = false;
   bool inGrayscaleMode = false;
 
+  // Heap buffers for grayscale compositing
+  uint8_t* bwBase = nullptr;           // snapshot of BW frame taken in displayBuffer
+  uint8_t* cached_lsb_mask = nullptr;  // LSB buffer saved by copyGrayscaleLsbBuffers
+
   // Init/update — mirrors GxEPD2 structure
   void hardwareReset();
   void _initDisplay();
@@ -114,7 +119,6 @@ class EInkDisplay_UC8179 {
   void _updatePart();
   void _powerOn();
   void _powerOff();
-  void writeDTM1_antiGhost(const uint8_t* old_bw, const uint8_t* new_bw, const uint8_t* gray_mask_map, uint32_t size);
 
   // SPI
   void sendCommand(uint8_t cmd);
@@ -132,6 +136,4 @@ class EInkDisplay_UC8179 {
 
   // Diagnostics helper
   uint8_t sendCommandReadByte(uint8_t cmd);
-
-  uint8_t* cached_lsb_mask = nullptr;
 };
