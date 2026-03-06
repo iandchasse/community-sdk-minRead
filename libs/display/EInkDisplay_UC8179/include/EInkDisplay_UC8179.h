@@ -1,62 +1,136 @@
-#ifndef EINK_DISPLAY_UC8179_H
-#define EINK_DISPLAY_UC8179_H
+#pragma once
+#include <Arduino.h>
+#include <SPI.h>
 
-#include "EInkDisplay.h"
+// ============================================================================
+// EInkDisplay_UC8179
+// Driver for GDEY075T7 (800x480, UC8179 controller).
+//
+// Sequence mirrors GxEPD2_750_GDEY075T7 exactly:
+//   _initDisplay()  — registers only (PSR/PWR/BTST/TRES/CDI/TCON/PWS), no PON
+//   _initFull()     — _initDisplay + PSR=0x1f (OTP) + _powerOn()
+//   _initPart()     — _initDisplay + PSR=0x3f + LUTs + _powerOn()
+//   _updateFull()   — CCSET/TSE + DRF  (no PON — already on from _initFull)
+//   _updatePart()   — DRF only         (no PON — already on from _initPart)
+//
+//   BUSY polarity: LOW = busy, HIGH = ready  (matches GxEPD2 busy_level=LOW)
+//
+// Refresh modes:
+//   FAST_REFRESH  — no-flicker differential waveform (register LUTs)
+//   HALF_REFRESH  — same waveform, both buffers identical (drives all pixels)
+//   FULL_REFRESH  — OTP waveform, then switches to partial mode
+//
+// Grayscale flow:
+//   copyGrayscaleLsbBuffers(lsb) / copyGrayscaleMsbBuffers(msb)
+//   displayGrayBuffer()
+//   next displayBuffer() call auto-runs grayscaleRevert()
+//
+// Compile flags:
+//   EINK_DISPLAY_SINGLE_BUFFER_MODE  — 48 KB RAM instead of 96 KB
+// ============================================================================
 
-// PSR constants for GDEY075T7 (800x480)
-// Bits: [7:6]=11 (800x480), [5]=REG, [4]=KWR, [3]=UD, [2]=SHL, [1]=SHD_N, [0]=RST_N
-// Default PSR_OTP is 0x1F: 800x480, OTP, KW mode, Scan up, Shift right, Booster ON, No reset
-// Default PSR_REG is 0x3F: 800x480, REG, KW mode, Scan up, Shift right, Booster ON, No reset
-static const uint8_t PSR_OTP = 0x1F;
-static const uint8_t PSR_REG = 0x3F;
-
-// CDI constants
-static const uint8_t CDI0_LUTKW = 0x29;  // border LUTKW, copy N2O (differential)
-static const uint8_t CDI0_LUTBD = 0x39;  // border LUTBD, copy N2O
-static const uint8_t CDI0_GRAY = 0x00;   // no copy for grayscale
-static const uint8_t CDI1 = 0x07;        // 10 hsync interval
-
-class EInkDisplay_UC8179 : public EInkDisplay {
+class EInkDisplay_UC8179 {
  public:
+  enum RefreshMode {
+    FULL_REFRESH,
+    HALF_REFRESH,
+    FAST_REFRESH,
+  };
+
+  static constexpr uint16_t DISPLAY_WIDTH = 800;
+  static constexpr uint16_t DISPLAY_HEIGHT = 480;
+  static constexpr uint16_t DISPLAY_WIDTH_BYTES = DISPLAY_WIDTH / 8;
+  static constexpr uint32_t BUFFER_SIZE = (uint32_t)DISPLAY_WIDTH_BYTES * DISPLAY_HEIGHT;  // 48000
+
   EInkDisplay_UC8179(int8_t sclk, int8_t mosi, int8_t cs, int8_t dc, int8_t rst, int8_t busy);
 
-  void begin() override;
-  void refreshDisplay(RefreshMode mode, bool turnOffScreen = false) override;
-  void clearScreen(uint8_t color = 0xFF) override;
-  void deepSleep() override;
+  void begin();
 
-  // These must align with the naming expected by HalDisplay and EInkDisplay base
-  void powerOnDisplay();
-  void powerOffDisplay();
+  // Frame-buffer operations (CPU-side only, no SPI)
+  void clearScreen(uint8_t color = 0xFF) const;
+  void drawImage(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                 bool fromProgmem = false) const;
+  void drawImageTransparent(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                            bool fromProgmem = false) const;
+  void setFramebuffer(const uint8_t* bwBuffer) const;
 
-  // Required by EInkDisplay common interface but specific to UC8179
-  void copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer) override;
-  void copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer) override;
-  void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) override;
-  void cleanupGrayscaleBuffers(const uint8_t* bwBuffer) override;
-  void displayGrayBuffer(bool turnOffScreen = false) override;
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  void swapBuffers();
+#endif
 
- protected:
-  void initDisplayController() override;
-  void resetDisplay() override;
-  void waitWhileBusy(const char* comment = nullptr) override;
+  // Grayscale buffer helpers
+  void copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer);
+  void copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer);
+  void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer);
 
-  void sendCommand(uint8_t cmd) override;
-  void sendData(uint8_t data) override;
-  void sendData(const uint8_t* data, uint32_t length) override;
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  void cleanupGrayscaleBuffers(const uint8_t* bwBuffer);
+#endif
+
+  // Display update
+  void displayBuffer(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
+  void displayGrayBuffer(bool turnOffScreen = false);
+  void grayscaleRevert();
+  void refreshDisplay(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
+  void setCustomLUT(bool enabled, const unsigned char* lutData = nullptr);
+
+  // Power management
+  void deepSleep();
+
+  // Buffer access
+  uint8_t* getFrameBuffer() const { return frameBuffer; }
+
+  // Desktop/test only
+  void saveFrameBufferAsPBM(const char* filename);
+
+  // Diagnostics
+  void diagnose();
 
  private:
+  int8_t _sclk, _mosi, _cs, _dc, _rst, _busy;
+
+  uint8_t frameBuffer0[BUFFER_SIZE];
+  uint8_t* frameBuffer;
+
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  uint8_t frameBuffer1[BUFFER_SIZE];
+  uint8_t* frameBufferPrev;
+#endif
+
+  SPISettings spiSettings;
+
+  bool _power_is_on = false;
+  bool _using_partial_mode = false;
+  bool inGrayscaleMode = false;
+
+  // Init/update — mirrors GxEPD2 structure
+  void hardwareReset();
+  void _initDisplay();
+  void _initFull();
+  void _initPart();
+  void _initGray();
+  void _updateFull();      // fast (TSFIX=90)
+  void _updateFullSlow();  // slow (internal temp sensor)
+  void _updatePart();
+  void _powerOn();
+  void _powerOff();
+
+  // SPI
+  void sendCommand(uint8_t cmd);
+  void sendData(uint8_t data);
+  void sendData(const uint8_t* data, uint32_t length);
+  void waitWhileBusy(const char* tag = nullptr);
+
+  // RAM write
   void writeDTM1(const uint8_t* data, uint32_t size);
   void writeDTM2(const uint8_t* data, uint32_t size);
-  void sendLutRegister(uint8_t cmd, const uint8_t* lut);
+  void _setPartialWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
-  void loadFastBwLUT();
-  void loadHalfRefreshLUT();
-  void loadGrayscaleLUT();
-  void loadGrayscaleRevertLUT();
+  // LUT
+  void sendLutRegister(uint8_t cmd, const uint8_t* lutProgmem);
 
-  bool isPoweredOn = false;
-  bool customLutActive = false;
+  // Diagnostics helper
+  uint8_t sendCommandReadByte(uint8_t cmd);
+
+  uint8_t* cached_lsb_mask = nullptr;
 };
-
-#endif

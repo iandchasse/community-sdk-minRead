@@ -478,8 +478,8 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
 
   // If currently in grayscale mode, revert first to black/white
   if (inGrayscaleMode) {
-    inGrayscaleMode = false;
     grayscaleRevert();
+    inGrayscaleMode = false;
   }
 
   // Set up full screen RAM area
