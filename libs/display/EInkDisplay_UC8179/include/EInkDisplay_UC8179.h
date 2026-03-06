@@ -114,6 +114,7 @@ class EInkDisplay_UC8179 {
   void _updatePart();
   void _powerOn();
   void _powerOff();
+  void writeDTM1_antiGhost(const uint8_t* old_bw, const uint8_t* new_bw, const uint8_t* gray_mask_map, uint32_t size);
 
   // SPI
   void sendCommand(uint8_t cmd);

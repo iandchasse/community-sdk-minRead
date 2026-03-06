@@ -81,37 +81,43 @@
 // ============================================================================
 
 // ============================================================================
-// Partial (fast, no-flicker) LUT — matches GxEPD2 lut_2x_partial exactly
-// Only changed pixels are driven. LUTWW/LUTKK = no drive.
 // ============================================================================
-#define T1 30
-#define T2 5
-#define T3 30
-#define T4 5
-
+// ============================================================================
+// ============================================================================
+// Custom Strong Anti-Ghosting Partial LUTs
+// Designed to aggressively clear mid-state gray particles during a normal B/W
+// page turn, without flashing the unchanged background pixels.
+//
+// Phase A: Push opposite direction (3 frames) to loosen particles
+// Phase B: Drive hard to target (35 frames)
+// Phase C: Push opposite direction (2 frames) to brake
+// Total: 40 frames (fast page turn speed)
+// ============================================================================
 static const uint8_t lut_partial_LUTC[42] PROGMEM = {
-    0x00, T1, T2, T3, T4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 static const uint8_t lut_partial_LUTWW[42] PROGMEM = {
-    0x00, T1, T2, T3, T4, 1,  // no drive
-    0,    0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 static const uint8_t lut_partial_LUTKW[42] PROGMEM = {
-    0x5A, T1, T2, T3, T4, 1,  // 01 01 10 10 — "more white"
-    0,    0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    // Black to White (Target VDH+) = 01_10_01_10 = 0x66
+    0x66, 3, 35, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 static const uint8_t lut_partial_LUTWK[42] PROGMEM = {
-    0x84, T1, T2, T3, T4, 1,  // 10 00 01 00
-    0,    0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    // White to Black (Target VDL-) = 10_01_10_01 = 0x99
+    0x99, 3, 35, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 static const uint8_t lut_partial_LUTKK[42] PROGMEM = {
-    0x00, T1, T2, T3, T4, 1,  // no drive
-    0,    0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 static const uint8_t lut_partial_LUTBD[42] PROGMEM = {
-    0x00, T1, T2, T3, T4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
 // ============================================================================
@@ -387,15 +393,20 @@ void EInkDisplay_UC8179::displayGrayBuffer(bool turnOffScreen) {
 }
 
 // ============================================================================
-// grayscaleRevert — clear mid-state charges after gray refresh
+// grayscaleRevert — clean up mode state without triggering redundant flashes
 // ============================================================================
 void EInkDisplay_UC8179::grayscaleRevert() {
   if (Serial) Serial.printf("[%lu] grayscaleRevert\n", millis());
-  writeDTM1(frameBuffer, BUFFER_SIZE);
-  writeDTM2(frameBuffer, BUFFER_SIZE);
-  // Partial LUT with identical buffers drives a uniform clearing pass.
-  if (!_using_partial_mode) _initPart();
-  _updatePart();
+
+  // We no longer trigger a forced hardware flash here.
+  // Doing so combined with the next displayBuffer(FAST) call caused
+  // redundant 600ms pauses that made page turns feel like full refreshes.
+  //
+  // Because `displayBuffer` correctly overwrites DTM1 with `frameBufferPrev`
+  // and DTM2 with the new `frameBuffer` right after this function returns,
+  // the custom 40-frame anti-ghosting partial LUTs will naturally and
+  // cleanly pull the physical gray particles into the correct black/white
+  // state during the normal page turn refresh automatically.
 }
 
 void EInkDisplay_UC8179::setCustomLUT(bool enabled, const unsigned char*) { (void)enabled; }
@@ -478,20 +489,33 @@ void EInkDisplay_UC8179::_initFull() {
 }
 
 // ============================================================================
-// _initPart — mirrors GxEPD2 _Init_Part() with useFastPartialUpdateFromOTP=true
+// _initPart — Partial refresh using actual Register LUTs
 //
-// CRITICAL DISCOVERY: GxEPD2 does NOT use register LUTs for partial on GDEY075T7.
-// It uses the OTP partial waveform with forced temperature (110°C via CCSET/TSSET).
-// PSR stays 0x1f. No LUT register writes. This is why our register-LUT approach
-// was producing grey banding and timeouts — wrong waveform entirely.
+// The forced 110C OTP partial refresh (0x6E) caused extreme ghosting on this
+// hardware. The proper GDEY075T7 fix is to load the Partial Register LUTs and
+// drive the display manually.
 // ============================================================================
 void EInkDisplay_UC8179::_initPart() {
   if (Serial) Serial.printf("[%lu] _initPart\n", millis());
   _initDisplay();
-  sendCommand(CMD_CCSET);
-  sendData(0x02);  // TSFIX — use forced temperature
-  sendCommand(CMD_TSSET);
-  sendData(0x6E);  // 110°C — activates fast OTP partial waveform
+
+  // PSR = 0x3f: register LUTs, KW mode
+  sendCommand(CMD_PSR);
+  sendData(PSR_REG);
+
+  // CDI for partial: LUTBD border, N2OCP=1 (Auto-copy DTM2->DTM1 after update)
+  sendCommand(CMD_CDI);
+  sendData(CDI0_LUTBD);
+  sendData(CDI1);
+
+  // Load B/W Partial Register LUTs
+  sendLutRegister(CMD_LUTC, lut_partial_LUTC);
+  sendLutRegister(CMD_LUTWW, lut_partial_LUTWW);
+  sendLutRegister(CMD_LUTKW, lut_partial_LUTKW);
+  sendLutRegister(CMD_LUTWK, lut_partial_LUTWK);
+  sendLutRegister(CMD_LUTKK, lut_partial_LUTKK);
+  sendLutRegister(CMD_LUTBD, lut_partial_LUTBD);
+
   _powerOn();
   _using_partial_mode = true;
 }
