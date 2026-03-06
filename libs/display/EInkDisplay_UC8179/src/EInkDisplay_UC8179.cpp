@@ -3,25 +3,24 @@
 //
 // Sequence mirrors GxEPD2_750_GDEY075T7.cpp (ZinggJM/GxEPD2) exactly:
 //
-//   _InitDisplay()  — PSR=0x1f, PWR, BTST, TRES, DUSPI, CDI, TCON, PWS (no PON)
-//   _Init_Full()    — _InitDisplay() + PSR=0x1f + PON
-//   _Init_Part()    — _InitDisplay() + CCSET=0x02 + TSSET=0x6E (110C OTP fast partial) + PON
-//                     Partial uses OTP waveform with forced temp — NOT register LUTs.
-//                     PSR stays 0x1f. No LUT registers written.
-//   _Update_Full()  — CCSET=0x02 + TSSET=0x5A (90C) + DRF
-//   _Update_Part()  — DRF only
+//   _initDisplay()  — PSR=0x1f, PWR, BTST, TRES, DUSPI, CDI, TCON, PWS (no PON)
+//   _initFull()     — _initDisplay() + PSR=0x1f + PON
+//   _initPart()     — _initDisplay() + PSR=0x3f + register LUTs + PON
+//   _initGray()     — _initDisplay() + PSR=0x3f + gray LUTs + PON
+//   _updateFull()   — CCSET=0x02 + TSSET=0x5A (90C) + DRF
+//   _updatePart()   — DRF only
 //
 // DTM write pattern uses partial window addressing (GxEPD2 style):
-//   CMD_PART_IN (0x91) + CMD_PART_WINDOW (0x90) [x,xe,y,ye,0x01] + CMD_DTM2 (0x13) + data + CMD_PART_OUT (0x92)
+//   CMD_PART_IN (0x91) + CMD_PART_WINDOW (0x90) + CMD_DTM + data + CMD_PART_OUT (0x92)
 //
 // Key facts:
 //   - busy_level = LOW: BUSY pin LOW while busy, HIGH when ready
-//   - PSR=0x1f for ALL modes — partial uses forced temperature not register LUTs
 //   - PON fires once per mode-switch, never before DRF
 
 #include "EInkDisplay_UC8179.h"
 
 #include <cstring>
+
 
 #ifndef ARDUINO
 #include <fstream>
@@ -57,108 +56,170 @@
 #define CMD_TSSET 0xE5
 #define CMD_PWS 0xE3
 
-// Partial window addressing (GxEPD2 uses these around every DTM write)
-#define CMD_PART_IN 0x91      // partial mode in
-#define CMD_PART_WINDOW 0x90  // set partial window [x, xe, y, ye, flags]
-#define CMD_PART_OUT 0x92     // partial mode out
+#define CMD_PART_IN 0x91
+#define CMD_PART_WINDOW 0x90
+#define CMD_PART_OUT 0x92
 
-#define PSR_OTP 0x1f  // KW mode, OTP LUTs  (full refresh)
-#define PSR_REG 0x3f  // KW mode, register LUTs (partial/gray)
+#define PSR_OTP 0x1f
+#define PSR_REG 0x3f
 
-// CDI byte 0
-#define CDI0_LUTKW 0x29  // LUTKW border, N2OCP (GxEPD2 _InitDisplay default)
-#define CDI0_LUTBD 0x39  // LUTBD border, N2OCP (GxEPD2 _Init_Part)
+#define CDI0_LUTKW 0x29
+#define CDI0_LUTBD 0x39
 #define CDI1 0x07
 
 // ============================================================================
-// LUT format: 7 groups × 6 bytes = 42 bytes, zero-padded
-// Byte 0: phase voltages MSB-first, 4×2-bit: 00=GND 01=VDL- 10=VDH+ 11=VCOM
+// LUT format: 7 groups x 6 bytes = 42 bytes, zero-padded
+// Byte 0:   phase voltages 4x2-bit MSB-first: 00=GND 01=VDH+ 10=VDL- 11=VCOM
 // Bytes 1-4: frame counts phases A-D
-// Byte 5: repeat count (0 = run once)
+// Byte 5:   repeat count (0 = run once)
 //
-// Transition routing (DTM1=old, DTM2=new):
-//   WW → LUTWW,  KW → LUTKW,  WK → LUTWK,  KK → LUTKK
+// Transition routing: DTM1=old, DTM2=new
+//   WW->LUTWW, KW->LUTKW (blk->wht), WK->LUTWK (wht->blk), KK->LUTKK
 // ============================================================================
 
 // ============================================================================
-// ============================================================================
-// ============================================================================
-// ============================================================================
-// Custom Strong Anti-Ghosting Partial LUTs
-// Designed to aggressively clear mid-state gray particles during a normal B/W
-// page turn, without flashing the unchanged background pixels.
+// VOLTAGE ENCODING (confirmed from UC8179 datasheet):
+//   00 = GND  (no drive)
+//   01 = VDH  -> drives pixel BLACK  (positive high voltage)
+//   10 = VDL  -> drives pixel WHITE  (negative low voltage)
+//   11 = VDHR (unused in KW mode, treat as floating)
 //
-// Phase A: Push opposite direction (3 frames) to loosen particles
-// Phase B: Drive hard to target (35 frames)
-// Phase C: Push opposite direction (2 frames) to brake
-// Total: 40 frames (fast page turn speed)
+// Phase byte: [Ph_A | Ph_B | Ph_C | Ph_D] each 2 bits, MSB first
+//   e.g. 0x80 = 10_00_00_00 = PhA=VDL(white), PhB-D=GND
+//        0x40 = 01_00_00_00 = PhA=VDH(black), PhB-D=GND
+//        0x60 = 01_10_00_00 = PhA=VDH(black), PhB=VDL(white)
+//        0x90 = 10_01_00_00 = PhA=VDL(white), PhB=VDH(black)
 // ============================================================================
+
+// ============================================================================
+// BW Partial LUT — anti-ghosting design
+//
+// DC-offset ghosting (faint previous text visible) means particles didn't fully
+// switch from the prior state. Fix: reversal pre-phase dislodges stuck particles
+// by briefly pushing the OPPOSITE direction before the main drive.
+//
+//   Phase A (reversal):   push OPPOSITE direction for TP_REV frames
+//   Phase B (main drive): push to TARGET for TP_MAIN frames
+//   Phase C (settle):     GND hold for TP_SETTLE frames
+//
+// LUTWW/LUTKK: unchanged pixels — genuine NOP, 1 frame GND.
+// DRF time = TP_REV + TP_MAIN + TP_SETTLE frames.
+//
+// Tuning:
+//   TP_REV:    increase (up to ~20) if ghosting persists after page turns
+//   TP_MAIN:   increase (up to ~40) if new content looks gray/faint
+//   TP_SETTLE: 2-4 is sufficient
+// ============================================================================
+#define TP_REV 10
+#define TP_MAIN 30
+#define TP_SETTLE 2
+
+// LUTC: VCOM at GND throughout partial refresh
 static const uint8_t lut_partial_LUTC[42] PROGMEM = {
-    0x00, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, TP_REV, TP_MAIN, TP_SETTLE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,      0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
+// LUTWW: white->white NOP
 static const uint8_t lut_partial_LUTWW[42] PROGMEM = {
-    0x00, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
+// LUTKW: black->white
+//   PhA reversal: VDH (01) = push black (same direction) — wait, black is already
+//   black. Reversal means push toward WHITE first to dislodge stuck black particles.
+//   PhA=VDL(10)=white reversal, PhB=VDL(10)=continue white drive, PhC=GND settle.
+//   Strong sustained white drive after brief white pre-charge.
+//   0x80 = 10_00_00_00: single phase, pure white drive — simple and clean
+//   With reversal: 0xA0 = 10_10_00_00: PhA+PhB both VDL(white)
+//   Use two-phase: PhA short reversal push (toward black=VDH), PhB long white drive.
+//   Reversal for K->W: particles are black, push toward black MORE first is wrong.
+//   Correct reversal for K->W: particles STUCK at black = push white(VDL) hard.
+//   There is no "opposite" for a fully-set black pixel. The pre-phase should be
+//   a brief VDH(black) to re-saturate, then a long VDL(white) to fully flip.
+//   PhA=VDH(01) re-saturate black, PhB=VDL(10) drive white, PhC=GND
+//   Encoding: 01_10_00_00 = 0x60
 static const uint8_t lut_partial_LUTKW[42] PROGMEM = {
-    // Black to White (Target VDH+) = 01_10_01_10 = 0x66
-    0x66, 3, 35, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x60, TP_REV, TP_MAIN, TP_SETTLE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,      0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
+// LUTWK: white->black
+//   PhA=VDL(10) re-saturate white, PhB=VDH(01) drive black, PhC=GND
+//   Encoding: 10_01_00_00 = 0x90
 static const uint8_t lut_partial_LUTWK[42] PROGMEM = {
-    // White to Black (Target VDL-) = 10_01_10_01 = 0x99
-    0x99, 3, 35, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x90, TP_REV, TP_MAIN, TP_SETTLE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,      0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
+// LUTKK: black->black NOP
 static const uint8_t lut_partial_LUTKK[42] PROGMEM = {
-    0x00, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
+// LUTBD: border same as LUTC
 static const uint8_t lut_partial_LUTBD[42] PROGMEM = {
-    0x00, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, TP_REV, TP_MAIN, TP_SETTLE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,      0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
 // ============================================================================
-// Hybrid Absolute Gray Compositing (No-Flicker Background)
+// AA Gray LUT — 2-level anti-aliasing from known BW starting state
 //
-// The renderer computes absolute 4-shade pixels via DTM1/DTM2.
-// 00=Black  11=White  01=DarkGray  10=LightGray
+// Starting state: white background (VDL-saturated), black text (VDH-saturated).
+// storeBwBuffer captures this exact state into frameBufferPrev.
 //
-// To avoid flashing the background, 00 and 11 are pure NOP.
-// The gray pixels (01, 10) use the validated 100-frame GxEPD2 waveforms
-// which perfectly drive particles from any state to the correct gray level.
+// Compositing routes pixels through LUT based on (DTM1=old, DTM2=new):
+//   (K,K) LUTKK -> black stays black      NOP
+//   (W,W) LUTWW -> white stays white      NOP
+//   (K,W) LUTKW -> black->light gray      partial VDL drive (push toward white)
+//   (W,K) LUTWK -> white->dark gray       partial VDH drive (push toward black)
+//
+// Single-phase drive: since starting state is known (fully saturated BW),
+// we just drive partway toward the opposite pole to land at gray.
+//
+// DRF time = TG_MAIN + TG_SETTLE frames. NOPs run for 1 frame only.
+//
+// Tuning TG_MAIN:
+//   Too low  -> gray too light / barely visible
+//   Too high -> gray too dark, looks almost BW
+//   Start 15, adjust +-3 until gray levels look right.
 // ============================================================================
-#define T_MAX 100  // GxEPD2 4G waveforms are exactly 100 frames
+#define TG_MAIN 15
+#define TG_SETTLE 3
 
-// LUTC (VCOM): no VCOM drive during gray overlay to minimize flicker
+// LUTC: VCOM at GND during gray drive (no VCOM contribution to gray level)
 static const uint8_t lut_gray_LUTC[42] PROGMEM = {
-    0x00, T_MAX, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
-
-// LUTWW (11, White Target): Pure NOP to prevent flashing white background
+// LUTWW: white->white NOP (must have nonzero frame count or controller skips)
 static const uint8_t lut_gray_LUTWW[42] PROGMEM = {
-    0x00, T_MAX, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
-
-// LUTWK (01, Dark Gray Target): Multi-phase GxEPD2_4G waveform (100 frames)
-static const uint8_t lut_gray_LUTWK[42] PROGMEM = {
-    0x40, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x90, 0x14, 0x14, 0x00, 0x00, 0x01, 0x00, 0x14,
-    0x0A, 0x00, 0x00, 0x01, 0x99, 0x0B, 0x04, 0x04, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
-// LUTKW (10, Light Gray Target): Multi-phase GxEPD2_4G waveform (100 frames)
+// LUTKW: black->light gray
+//   Drive VDL(10)=white for TG_MAIN frames from fully-black starting state.
+//   Stops partway = light gray.
+//   Encoding: 10_00_00_00 = 0x80
 static const uint8_t lut_gray_LUTKW[42] PROGMEM = {
-    0x40, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x90, 0x14, 0x14, 0x00, 0x00, 0x01, 0x00, 0x14,
-    0x0A, 0x00, 0x00, 0x01, 0x99, 0x0C, 0x01, 0x03, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x80, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
-
-// LUTKK (00, Black Target): Pure NOP to prevent flashing black background
+// LUTWK: white->dark gray
+//   Drive VDH(01)=black for TG_MAIN frames from fully-white starting state.
+//   Stops partway = dark gray.
+//   Encoding: 01_00_00_00 = 0x40
+static const uint8_t lut_gray_LUTWK[42] PROGMEM = {
+    0x40, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+// LUTKK: black->black NOP (nonzero frame count to match DRF timing)
 static const uint8_t lut_gray_LUTKK[42] PROGMEM = {
-    0x00, T_MAX, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+// LUTBD: border NOP (match timing)
+static const uint8_t lut_gray_LUTBD[42] PROGMEM = {
+    0x00, TG_MAIN, TG_SETTLE, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,       0,         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
 // ============================================================================
@@ -178,10 +239,8 @@ EInkDisplay_UC8179::EInkDisplay_UC8179(int8_t sclk, int8_t mosi, int8_t cs, int8
 #endif
 {
   if (Serial)
-    Serial.printf(
-        "[%lu] EInkDisplay_UC8179: "
-        "SCLK=%d MOSI=%d CS=%d DC=%d RST=%d BUSY=%d\n",
-        millis(), sclk, mosi, cs, dc, rst, busy);
+    Serial.printf("[%lu] EInkDisplay_UC8179: SCLK=%d MOSI=%d CS=%d DC=%d RST=%d BUSY=%d\n", millis(), sclk, mosi, cs,
+                  dc, rst, busy);
 }
 
 // ============================================================================
@@ -210,7 +269,7 @@ void EInkDisplay_UC8179::begin() {
   pinMode(_busy, INPUT);
 
   hardwareReset();
-  _initDisplay();  // registers only, no PON/DRF — mirrors GxEPD2 _InitDisplay()
+  _initDisplay();
 
   if (Serial) Serial.printf("[%lu] begin() done\n", millis());
 }
@@ -265,10 +324,6 @@ void EInkDisplay_UC8179::drawImageTransparent(const uint8_t* img, uint16_t x, ui
 // ============================================================================
 // Grayscale buffer helpers
 // ============================================================================
-// The renderer generates LSB and MSB masks sequentially and clears its own
-// frame buffer in between. We must intercept the masks, cache the LSB pass,
-// and then precisely composite them with the OLD base B/W buffer.
-// We write exact 4-shade absolute pixel states to DTM1 (LSB) and DTM2 (MSB).
 void EInkDisplay_UC8179::copyGrayscaleLsbBuffers(const uint8_t* lsb) {
   if (!cached_lsb_mask) {
     cached_lsb_mask = (uint8_t*)malloc(BUFFER_SIZE);
@@ -284,35 +339,44 @@ void EInkDisplay_UC8179::copyGrayscaleMsbBuffers(const uint8_t* msb) {
   if (!cached_lsb_mask) return;
 
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  uint8_t* base = frameBufferPrev;  // Contains the actual visible B/W page
+  uint8_t* base = frameBufferPrev;
 #else
-  uint8_t* base = frameBuffer;  // Fallback if no dual buffer
+  uint8_t* base = frameBuffer;
 #endif
 
   uint8_t* target = (uint8_t*)malloc(BUFFER_SIZE);
-
   if (target) {
-    // Generate and send DTM1 (Target LSB)
-    // Target_LSB = (~base & ~msb) | (msb & ~lsb)
+    // UC8179 register LUT routes on (DTM1=old, DTM2=new) pixel pairs:
+    //   (0,0) LUTKK -> black NOP          (1,1) LUTWW -> white NOP
+    //   (0,1) LUTKW -> black->light gray   (1,0) LUTWK -> white->dark gray
+    //
+    // Renderer convention: drawPixel(false) SETS the bit to 1 (white direction).
+    // Buffers start as BW copy (black text=0, white bg=1).
+    // Gray pixel bits are set to 1 (carved out of black text):
+    //   MSB buf: bmpVal==1 (dark gray) or bmpVal==2 (light gray) -> bit set to 1
+    //   LSB buf: bmpVal==1 (dark gray) only                       -> bit set to 1
+    //
+    // Truth table (b=base, m=msb_buf, l=lsb_buf):
+    //   b=0 m=0 l=0 -> pure black  -> DTM1=0, DTM2=0 -> LUTKK NOP
+    //   b=0 m=1 l=0 -> light gray  -> DTM1=0, DTM2=1 -> LUTKW black->light gray
+    //   b=0 m=1 l=1 -> dark gray   -> DTM1=1, DTM2=0 -> LUTWK white->dark gray
+    //   b=1 m=0 l=0 -> white bg    -> DTM1=1, DTM2=1 -> LUTWW NOP
+    //
+    // Derived:  DTM1 = base | (msb & lsb)
+    //           DTM2 = base | (msb & ~lsb)
     for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
-      uint8_t not_b = ~base[i];
-      uint8_t not_m = ~msb[i];
-      target[i] = (not_b & not_m) | (msb[i] & ~cached_lsb_mask[i]);
+      target[i] = base[i] | (msb[i] & cached_lsb_mask[i]);
     }
     writeDTM1(target, BUFFER_SIZE);
 
-    // Generate and send DTM2 (Target MSB)
-    // Target_MSB = (~base & ~msb) | (msb & lsb)
     for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
-      uint8_t not_b = ~base[i];
-      uint8_t not_m = ~msb[i];
-      target[i] = (not_b & not_m) | (msb[i] & cached_lsb_mask[i]);
+      target[i] = base[i] | (msb[i] & ~cached_lsb_mask[i]);
     }
     writeDTM2(target, BUFFER_SIZE);
 
     free(target);
   } else {
-    if (Serial) Serial.println("malloc failed for target mask composition");
+    if (Serial) Serial.println("malloc failed for gray composite");
   }
 
   free(cached_lsb_mask);
@@ -338,39 +402,23 @@ void EInkDisplay_UC8179::displayBuffer(RefreshMode mode, bool turnOffScreen) {
   }
 
   if (mode == HALF_REFRESH) {
-    // Fast full refresh — single flicker, drives all pixels.
-    // CRITICAL: init BEFORE writing DTM. Writing PSR in _initDisplay()
-    // resets the UC8179 RAM address counter. DTM must be written AFTER
-    // init (while powered on) so the address pointer is valid for DRF.
-    _initFull();                          // POF → registers → PSR=OTP → PON
-    writeDTM1(frameBuffer, BUFFER_SIZE);  // write RAM while powered
-    writeDTM2(frameBuffer, BUFFER_SIZE);  // same data → all pixels driven
-    _updateFull();                        // CCSET + TSSET + DRF
-    // Re-init partial mode so the next FAST_REFRESH works immediately.
+    _initFull();
+    writeDTM1(frameBuffer, BUFFER_SIZE);
+    writeDTM2(frameBuffer, BUFFER_SIZE);
+    _updateFull();
     _initPart();
   } else if (mode == FAST_REFRESH) {
-    // No-flicker OTP partial refresh with forced temperature (110°C).
-    // Uses the OTP waveform — no register LUTs loaded.
     if (!_using_partial_mode) _initPart();
-
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-    writeDTM1(frameBufferPrev, BUFFER_SIZE);  // old frame
+    writeDTM1(frameBufferPrev, BUFFER_SIZE);
 #endif
-    writeDTM2(frameBuffer, BUFFER_SIZE);  // new frame
+    writeDTM2(frameBuffer, BUFFER_SIZE);
     _updatePart();
-
-    // N2OCP=1 in CDI means the controller automatically copies DTM2→DTM1
-    // after every refresh, so the "old" frame is always up to date.
-    // We still swap the CPU-side buffers in dual-buffer mode so frameBufferPrev
-    // reflects the frame just displayed, but no DTM1 re-write is needed.
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
     swapBuffers();
 #endif
-    // Single-buffer mode: N2OCP handles DTM1 sync in hardware — no writeDTM1 needed.
   } else {
-    // FULL_REFRESH — slow OTP waveform, multi-flicker.
-    // Rarely needed; use HALF_REFRESH for normal full-screen updates.
-    // Init first, write RAM after (address counter reset by PSR write).
+    // FULL_REFRESH
     _initFull();
     writeDTM1(frameBuffer, BUFFER_SIZE);
     writeDTM2(frameBuffer, BUFFER_SIZE);
@@ -378,35 +426,39 @@ void EInkDisplay_UC8179::displayBuffer(RefreshMode mode, bool turnOffScreen) {
     _initPart();
   }
 
-  if (turnOffScreen) _powerOff();
+  if (turnOffScreen) {
+    _powerOff();
+  } else {
+    // Pre-initialise gray mode so the controller SRAM stays live.
+    // copyGrayscaleLsbBuffers/copyGrayscaleMsbBuffers will write DTM
+    // while power is on. displayGrayBuffer then fires DRF directly —
+    // no PON cycle that would wipe the SRAM we just loaded.
+    _initGray();
+  }
 }
 
 // ============================================================================
-// displayGrayBuffer — DTM1/DTM2 already loaded by caller
+// displayGrayBuffer
+// _initGray() was already called at the end of displayBuffer while power was
+// still on. DTM SRAM was written by copyGrayscaleMsbBuffers with power live.
+// Just fire DRF here — DO NOT call _initGray() again or it will POF/PON and
+// wipe the SRAM contents before DRF can read them.
 // ============================================================================
 void EInkDisplay_UC8179::displayGrayBuffer(bool turnOffScreen) {
   if (Serial) Serial.printf("[%lu] displayGrayBuffer\n", millis());
   inGrayscaleMode = true;
-  _initGray();
   _updatePart();
   if (turnOffScreen) _powerOff();
 }
 
 // ============================================================================
-// grayscaleRevert — clean up mode state without triggering redundant flashes
+// grayscaleRevert
+// No-op: the next displayBuffer(FAST_REFRESH) supplies fresh DTM1/DTM2 with
+// the BW frame, and the anti-ghosting partial LUT waveform will pull gray
+// particles cleanly to full BW during the normal page turn.
 // ============================================================================
 void EInkDisplay_UC8179::grayscaleRevert() {
-  if (Serial) Serial.printf("[%lu] grayscaleRevert\n", millis());
-
-  // We no longer trigger a forced hardware flash here.
-  // Doing so combined with the next displayBuffer(FAST) call caused
-  // redundant 600ms pauses that made page turns feel like full refreshes.
-  //
-  // Because `displayBuffer` correctly overwrites DTM1 with `frameBufferPrev`
-  // and DTM2 with the new `frameBuffer` right after this function returns,
-  // the custom 40-frame anti-ghosting partial LUTs will naturally and
-  // cleanly pull the physical gray particles into the correct black/white
-  // state during the normal page turn refresh automatically.
+  if (Serial) Serial.printf("[%lu] grayscaleRevert (no-op)\n", millis());
 }
 
 void EInkDisplay_UC8179::setCustomLUT(bool enabled, const unsigned char*) { (void)enabled; }
@@ -423,20 +475,18 @@ void EInkDisplay_UC8179::deepSleep() {
 }
 
 // ============================================================================
-// refreshDisplay — public shim so existing HAL call sites still compile
+// refreshDisplay — shim for legacy call sites
 // ============================================================================
 void EInkDisplay_UC8179::refreshDisplay(RefreshMode mode, bool turnOffScreen) { displayBuffer(mode, turnOffScreen); }
 
 // ============================================================================
-// _initDisplay — mirrors GxEPD2 _InitDisplay() exactly
-// Registers only. No PON, no DRF.
+// _initDisplay — exact GxEPD2 _InitDisplay() register order
 // ============================================================================
 void EInkDisplay_UC8179::_initDisplay() {
   if (Serial) Serial.printf("[%lu] _initDisplay\n", millis());
 
-  // Exact GxEPD2 _InitDisplay() order — PSR first, then PWR, then BTST.
   sendCommand(CMD_PSR);
-  sendData(PSR_OTP);  // 0x1f — KW OTP mode
+  sendData(PSR_OTP);
 
   sendCommand(CMD_PWR);
   sendData(0x07);
@@ -445,10 +495,6 @@ void EInkDisplay_UC8179::_initDisplay() {
   sendData(0x3f);
   sendData(0x09);
 
-  // BTST — GxEPD2 uses 0x17, 0x17, 0x28, 0x17 exactly.
-  // 0x28 = strength 5, 0.27us min-off for phase C (VDHR, red channel — unused in KW mode).
-  // Restore GxEPD2 defaults; our earlier "fix" to 0x17 was wrong — the working
-  // GxEPD2 code uses 0x28 for PHC1 and it works fine on this hardware.
   sendCommand(CMD_BTST);
   sendData(0x17);
   sendData(0x17);
@@ -457,17 +503,15 @@ void EInkDisplay_UC8179::_initDisplay() {
 
   sendCommand(CMD_TRES);
   sendData(0x03);
-  sendData(0x20);  // 800
+  sendData(0x20);
   sendData(0x01);
-  sendData(0xE0);  // 480
+  sendData(0xE0);
 
   sendCommand(CMD_DUSPI);
   sendData(0x00);
-
   sendCommand(CMD_CDI);
   sendData(CDI0_LUTKW);
-  sendData(CDI1);  // 0x29, 0x07
-
+  sendData(CDI1);
   sendCommand(CMD_TCON);
   sendData(0x22);
   sendCommand(CMD_PWS);
@@ -475,112 +519,87 @@ void EInkDisplay_UC8179::_initDisplay() {
 }
 
 // ============================================================================
-// _initFull — mirrors GxEPD2 _Init_Full() exactly
-// _InitDisplay() + PSR=0x1f (redundant, already set) + PON
+// _initFull
 // ============================================================================
 void EInkDisplay_UC8179::_initFull() {
   if (Serial) Serial.printf("[%lu] _initFull\n", millis());
-  _powerOff();  // ensure clean state, resets _power_is_on
+  _powerOff();
   _initDisplay();
   sendCommand(CMD_PSR);
-  sendData(PSR_OTP);  // 0x1f — GxEPD2 sends this again after _InitDisplay
+  sendData(PSR_OTP);
   _powerOn();
   _using_partial_mode = false;
 }
 
 // ============================================================================
-// _initPart — Partial refresh using actual Register LUTs
-//
-// The forced 110C OTP partial refresh (0x6E) caused extreme ghosting on this
-// hardware. The proper GDEY075T7 fix is to load the Partial Register LUTs and
-// drive the display manually.
+// _initPart — anti-ghosting register LUT partial mode
 // ============================================================================
 void EInkDisplay_UC8179::_initPart() {
   if (Serial) Serial.printf("[%lu] _initPart\n", millis());
   _initDisplay();
-
-  // PSR = 0x3f: register LUTs, KW mode
   sendCommand(CMD_PSR);
   sendData(PSR_REG);
-
-  // CDI for partial: LUTBD border, N2OCP=1 (Auto-copy DTM2->DTM1 after update)
+  sendCommand(CMD_VDCS);
+  sendData(0x30);
   sendCommand(CMD_CDI);
   sendData(CDI0_LUTBD);
   sendData(CDI1);
-
-  // Load B/W Partial Register LUTs
   sendLutRegister(CMD_LUTC, lut_partial_LUTC);
   sendLutRegister(CMD_LUTWW, lut_partial_LUTWW);
   sendLutRegister(CMD_LUTKW, lut_partial_LUTKW);
   sendLutRegister(CMD_LUTWK, lut_partial_LUTWK);
   sendLutRegister(CMD_LUTKK, lut_partial_LUTKK);
   sendLutRegister(CMD_LUTBD, lut_partial_LUTBD);
-
   _powerOn();
   _using_partial_mode = true;
 }
 
 // ============================================================================
-// _initGray — like _initPart but with gray LUTs
+// _initGray — fast 2-level AA gray mode
 // ============================================================================
 void EInkDisplay_UC8179::_initGray() {
   if (Serial) Serial.printf("[%lu] _initGray\n", millis());
   _initDisplay();
-
-  // PSR = 0x3f: register LUTs, KWR mode (needed for 4-gray differential)
   sendCommand(CMD_PSR);
   sendData(PSR_REG);
-
+  sendCommand(CMD_VDCS);
+  sendData(0x30);
   sendCommand(CMD_CDI);
-  sendData(0x31);  // DDX=00, VBD=LUTBD, N2OCP=0, CDI=001
+  sendData(0x31);
   sendData(CDI1);
-
-  // Load custom 4-gray absolute mapping LUTs
   sendLutRegister(CMD_LUTC, lut_gray_LUTC);
   sendLutRegister(CMD_LUTWW, lut_gray_LUTWW);
   sendLutRegister(CMD_LUTKW, lut_gray_LUTKW);
   sendLutRegister(CMD_LUTWK, lut_gray_LUTWK);
   sendLutRegister(CMD_LUTKK, lut_gray_LUTKK);
-  sendLutRegister(CMD_LUTBD, lut_partial_LUTBD);
-
+  sendLutRegister(CMD_LUTBD, lut_gray_LUTBD);
   _powerOn();
-  // CRITICAL: We changed registers (PSR, CDI, LUTs). We are NO LONGER in the standard
-  // _initPart state. We must clear this flag so the next B/W update forces a re-init.
-  _using_partial_mode = false;
+  _using_partial_mode = false;  // gray uses different regs, force re-init on next BW
 }
 
 // ============================================================================
-// _updateFull — mirrors GxEPD2 _Update_Full()
-// CCSET + TSSET (temp sensor) + DRF. No PON — already on from _initFull().
+// _updateFull / _updateFullSlow / _updatePart
 // ============================================================================
-// Fast full refresh — TSFIX forces 90° which gives the single-flicker waveform.
-// Matches GxEPD2 _Update_Full() with useFastFullUpdate=true.
 void EInkDisplay_UC8179::_updateFull() {
-  if (Serial) Serial.printf("[%lu] _updateFull fast (DRF)...\n", millis());
+  if (Serial) Serial.printf("[%lu] _updateFull (DRF)...\n", millis());
   sendCommand(CMD_CCSET);
-  sendData(0x02);  // TSFIX = use forced temperature
+  sendData(0x02);
   sendCommand(CMD_TSSET);
-  sendData(0x5A);  // 90°C — activates fast waveform
+  sendData(0x5A);
   sendCommand(CMD_DRF);
   waitWhileBusy("DRF full");
 }
 
-// Slow full refresh — internal temperature sensor, multi-flicker OTP waveform.
-// Only used by FULL_REFRESH mode. Matches GxEPD2 useFastFullUpdate=false path.
 void EInkDisplay_UC8179::_updateFullSlow() {
-  if (Serial) Serial.printf("[%lu] _updateFull slow (DRF)...\n", millis());
+  if (Serial) Serial.printf("[%lu] _updateFullSlow (DRF)...\n", millis());
   sendCommand(CMD_CCSET);
-  sendData(0x00);  // no TSFIX
+  sendData(0x00);
   sendCommand(CMD_TSE);
-  sendData(0x00);  // internal temperature sensor
+  sendData(0x00);
   sendCommand(CMD_DRF);
   waitWhileBusy("DRF full slow");
 }
 
-// ============================================================================
-// _updatePart — mirrors GxEPD2 _Update_Part()
-// DRF only. No PON — already on from _initPart().
-// ============================================================================
 void EInkDisplay_UC8179::_updatePart() {
   if (Serial) Serial.printf("[%lu] _updatePart (DRF)...\n", millis());
   sendCommand(CMD_DRF);
@@ -588,7 +607,7 @@ void EInkDisplay_UC8179::_updatePart() {
 }
 
 // ============================================================================
-// _powerOn / _powerOff — mirrors GxEPD2 _PowerOn / _PowerOff
+// _powerOn / _powerOff
 // ============================================================================
 void EInkDisplay_UC8179::_powerOn() {
   if (!_power_is_on) {
@@ -610,16 +629,16 @@ void EInkDisplay_UC8179::_powerOff() {
 }
 
 // ============================================================================
-// hardwareReset — matches GxEPD2 _reset() timing exactly
+// hardwareReset — GxEPD2 timing
 // ============================================================================
 void EInkDisplay_UC8179::hardwareReset() {
   if (Serial) Serial.printf("[%lu] hardwareReset\n", millis());
   digitalWrite(_rst, HIGH);
   delay(20);
   digitalWrite(_rst, LOW);
-  delay(10);  // GxEPD2 default reset_duration=10
+  delay(10);
   digitalWrite(_rst, HIGH);
-  delay(200);  // GxEPD2 waits 200ms after reset
+  delay(200);
   if (Serial) Serial.printf("[%lu] hardwareReset done\n", millis());
 }
 
@@ -654,13 +673,12 @@ void EInkDisplay_UC8179::sendData(const uint8_t* data, uint32_t length) {
 }
 
 // ============================================================================
-// waitWhileBusy
-// busy_level = LOW (pin LOW while busy, HIGH when ready) — from GxEPD2 constructor
+// waitWhileBusy — BUSY LOW = busy, HIGH = ready
 // ============================================================================
 void EInkDisplay_UC8179::waitWhileBusy(const char* tag) {
-  delay(1);  // margin for controller to assert BUSY
+  delay(1);
   unsigned long t0 = millis();
-  while (digitalRead(_busy) == LOW) {  // LOW = busy
+  while (digitalRead(_busy) == LOW) {
     delay(1);
     if (millis() - t0 > 10000) {
       if (Serial) Serial.printf("[%lu] TIMEOUT: %s\n", millis(), tag ? tag : "");
@@ -671,14 +689,12 @@ void EInkDisplay_UC8179::waitWhileBusy(const char* tag) {
 }
 
 // ============================================================================
-// RAM helpers — partial window addressing (mirrors GxEPD2 exactly)
-// GxEPD2 wraps every DTM write with CMD_PART_IN / _PART_WINDOW / _PART_OUT.
-// Without the window commands the controller doesn't know which region to refresh.
+// Partial window addressing
 // ============================================================================
 void EInkDisplay_UC8179::_setPartialWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
-  uint16_t xe = (x + w - 1) | 0x0007;  // byte boundary inclusive
+  uint16_t xe = (x + w - 1) | 0x0007;
   uint16_t ye = y + h - 1;
-  x &= 0xFFF8;  // byte boundary
+  x &= 0xFFF8;
   sendCommand(CMD_PART_WINDOW);
   sendData(x / 256);
   sendData(x % 256);
@@ -717,7 +733,7 @@ void EInkDisplay_UC8179::sendLutRegister(uint8_t cmd, const uint8_t* pgmData) {
 }
 
 // ============================================================================
-// saveFrameBufferAsPBM
+// saveFrameBufferAsPBM (desktop/test only)
 // ============================================================================
 void EInkDisplay_UC8179::saveFrameBufferAsPBM(const char* filename) {
 #ifndef ARDUINO
@@ -740,14 +756,11 @@ void EInkDisplay_UC8179::saveFrameBufferAsPBM(const char* filename) {
 }
 
 // ============================================================================
-// diagnose() — call after begin(), prints to Serial
+// diagnose()
 // ============================================================================
 void EInkDisplay_UC8179::diagnose() {
   Serial.println("=== EInkDisplay_UC8179::diagnose() ===");
-  int busyNow = digitalRead(_busy);
-  Serial.printf("  BUSY at idle: %d  (expected 1 = HIGH = ready)\n", busyNow);
-
-  // Send PON and watch BUSY
+  Serial.printf("  BUSY at idle: %d  (expected 1 = HIGH = ready)\n", digitalRead(_busy));
   Serial.println("  Sending PON and watching BUSY for 500ms...");
   sendCommand(CMD_PON);
   unsigned long t0 = millis();
@@ -760,14 +773,12 @@ void EInkDisplay_UC8179::diagnose() {
     delay(1);
   }
   if (wentLow) {
-    Serial.printf("  BUSY went LOW %lu ms after PON — controller responding\n", millis() - t0);
-    // wait for it to go HIGH again
+    Serial.printf("  BUSY went LOW %lu ms after PON\n", millis() - t0);
     t0 = millis();
     while (digitalRead(_busy) == LOW && millis() - t0 < 5000) delay(1);
-    Serial.printf("  BUSY HIGH again after %lu ms total\n", millis() - t0);
+    Serial.printf("  BUSY HIGH again after %lu ms\n", millis() - t0);
   } else {
-    Serial.println("  BUSY never went LOW after PON — analog section not starting");
-    Serial.println("  Check: PWR register, BTST register, VCC supply to panel");
+    Serial.println("  BUSY never went LOW — booster not starting");
   }
   sendCommand(CMD_POF);
   delay(100);
